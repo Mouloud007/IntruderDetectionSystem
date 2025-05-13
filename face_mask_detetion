@@ -1,162 +1,234 @@
+# Importing OpenCV for video capture and image processing
 import cv2
+
+# Importing Flask to create a web server for streaming video feed
 from flask import Flask, Response
+
+# Importing YOLO from the ultralytics library for object detection
 from ultralytics import YOLO
+
+# Importing MQTT client for sending alerts via the MQTT protocol
 import paho.mqtt.client as mqtt
+
+# Importing JSON for formatting data to send over MQTT
 import json
+
+# Importing time for handling delays and cooldowns
 import time
+
+# Importing SQLite3 for managing a local database of known faces
 import sqlite3
+
+# Importing NumPy for numerical operations, such as handling face encodings
 import numpy as np
+
+# Importing face_recognition for face detection and recognition
 import face_recognition
 
-# Flask app
+# Importing threading to handle concurrent tasks, such as sending emails
+import threading
+
+# Importing smtplib to send email alerts
+import smtplib
+
+# Importing EmailMessage to format email content
+from email.message import EmailMessage
+
+# Importing os to access environment variables and file paths
+import os
+
+# Importing atexit to register cleanup functions that run when the program exits
+import atexit
+
+# Initialize the Flask app for serving the video feed
 app = Flask(__name__)
 
-# MQTT configuration
-mqtt_broker = "localhost"
-mqtt_port = 1883
-mqtt_topic_intruder = "home/intruder_alert"
-mqtt_topic_known_person = "home/known_person"
+# MQTT Configuration
+mqtt_broker = "192.168.1.253"  # IP address of the MQTT broker
+mqtt_port = 1883  # Port for MQTT communication
+mqtt_topic_intruder = "home/intruder_alert"  # Topic for intruder alerts
 
-# Initialize MQTT client
-client = mqtt.Client()
+# Email Configuration
+EMAIL_SENDER = os.getenv("EMAIL_SENDER", "your_email@gmail.com")  # Sender email address
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "your_app_password")  # App password for the sender email
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", "receiver_email@gmail.com")  # Receiver email address
+EMAIL_COOLDOWN = 10  # Minimum time (in seconds) between email alerts
+last_email_time = 0  # Tracks the last time an email was sent
+email_lock = threading.Lock()  # Prevents multiple emails from being sent simultaneously
 
-# MQTT Connection Callback
+# MQTT Client
+client = mqtt.Client()  # Initialize the MQTT client
+
+# Define the callback function for when the MQTT client connects to the broker
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print("✅ Connected to MQTT Broker!")
     else:
-        print(f"❌ Failed to connect to MQTT Broker. Return code: {rc}")
+        raise ConnectionError(f"❌ Failed to connect to MQTT Broker. Return code: {rc}")
 
 client.on_connect = on_connect
-client.connect(mqtt_broker, mqtt_port, 60)
-client.loop_start()  # Start MQTT processing loop
+try:
+    client.connect(mqtt_broker, mqtt_port, 60)  # Connect to the MQTT broker
+except Exception as e:
+    print(f"❌ MQTT connection error: {e}")
+client.loop_start()  # Start the MQTT client loop in a separate thread
 
-# Load YOLOv8 model
-model = YOLO("yolov8n.pt")
+# Load YOLO Models
+old_model = YOLO("yolov8n.pt")  # Load the YOLO model for general object detection
+mask_model_path = "/home/mouloudelg/Desktop/New Model/best.pt"  # Path to the mask detection model
+if not os.path.exists(mask_model_path):
+    raise FileNotFoundError(f"❌ Mask model file not found at {mask_model_path}")
+new_model = YOLO(mask_model_path)  # Load the YOLO model for mask detection
 
-# Open webcam
-cap = cv2.VideoCapture(0)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+# Open Webcam
+cap = cv2.VideoCapture(0)  # Open the default webcam
+if not cap.isOpened():
+    raise RuntimeError("❌ Could not open webcam. Check connection or permissions.")
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)  # Set the width of the video feed
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)  # Set the height of the video feed
 
-# Load known faces from the database
+# Function to load known faces and their encodings from the SQLite database
 def load_known_faces():
-    conn = sqlite3.connect("faces.db")
+    conn = sqlite3.connect("faces.db")  # Connect to the SQLite database
     cursor = conn.cursor()
-    cursor.execute("SELECT name, encoding FROM known_faces")
-    known_faces = []
-    known_names = []
-
-    for row in cursor.fetchall():
-        name, encoding_blob = row
-        encoding = np.frombuffer(encoding_blob, dtype=np.float64)
-        known_faces.append(encoding)
-        known_names.append(name)
-
+    try:
+        cursor.execute("SELECT name, encoding FROM known_faces")  # Query the database for known faces
+        known_faces = []
+        known_names = []
+        for row in cursor.fetchall():
+            name, encoding_blob = row
+            encoding = np.frombuffer(encoding_blob, dtype=np.float64)  # Convert binary encoding to NumPy array
+            known_faces.append(encoding)
+            known_names.append(name)
+    except sqlite3.OperationalError:
+        print("❌ Database table 'known_faces' not found. Starting with empty face list.")
+        known_faces, known_names = [], []
     conn.close()
-    
     print(f"✅ Loaded {len(known_faces)} known faces from the database")
     return known_faces, known_names
 
+# Load the known faces and their names into memory
 known_faces, known_names = load_known_faces()
 
-# Cooldown period to avoid spamming alerts (in seconds)
-ALERT_COOLDOWN = 10  
-last_intruder_alert_time = 0
-last_known_person_alert_time = 0
+# Alert cooldown settings to avoid spamming alerts
+ALERT_COOLDOWN = 10  # Minimum time (in seconds) between intruder alerts
+last_intruder_alert_time = 0  # Tracks the last time an intruder alert was sent
+intruder_counter = 0  # Keeps count of detected intruders
 
-# Counter for incremental alerts
-intruder_counter = 0
-known_person_counter = 0
+# Function to send an email alert when an intruder is detected
+def send_email_alert():
+    global last_email_time
+    if (time.time() - last_email_time) < EMAIL_COOLDOWN:
+        print("📧 Email alert skipped due to cooldown.")
+        return
+    if email_lock.acquire(blocking=False):  # Ensure only one email is sent at a time
+        def email_task():
+            try:
+                msg = EmailMessage()
+                msg["Subject"] = "🚨 Intruder Alert!"
+                msg["From"] = EMAIL_SENDER
+                msg["To"] = EMAIL_RECEIVER
+                msg.set_content("An intruder has been detected!")
+                with smtplib.SMTP("smtp.gmail.com", 587) as server:
+                    server.starttls()
+                    server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+                    server.send_message(msg)
+                    print("📧 Email alert sent successfully!")
+                    global last_email_time
+                    last_email_time = time.time()
+            except Exception as e:
+                print(f"❌ Failed to send email alert: {e}")
+            finally:
+                email_lock.release()
+        threading.Thread(target=email_task, daemon=True).start()
+    else:
+        print("📧 Email sending skipped: another email is in progress.")
 
+# Function to generate video frames with detection overlays
 def generate_frames():
-    global last_intruder_alert_time, last_known_person_alert_time
-    global intruder_counter, known_person_counter
-
+    global last_intruder_alert_time, intruder_counter
     while True:
         success, frame = cap.read()
         if not success:
             print("❌ Failed to capture frame from webcam")
             break
 
-        # Run YOLO detection
-        results = model(frame)
-        detected_objects = results[0].boxes.cls.tolist()
+        # Old model (person detection)
+        old_results = old_model(frame)
+        old_detected_objects = old_results[0].boxes.cls.tolist()
+        old_boxes = old_results[0].boxes.xyxy.tolist()
 
-        print(f"🎯 Detected objects: {detected_objects}")  # Debug YOLO detections
+        # New model (mask detection)
+        new_results = new_model(frame)
+        new_detected_objects = new_results[0].boxes.cls.tolist()
+        new_boxes = new_results[0].boxes.xyxy.tolist()
+        new_confidences = new_results[0].boxes.conf.tolist()
 
         intruder_detected = False
-        known_person_detected = False
-        detected_person = False  
-
-        for obj in detected_objects:
+        for i, obj in enumerate(old_detected_objects):
             if obj == 0:  # Person detected
-                detected_person = True
-                face_locations = face_recognition.face_locations(frame)
-                face_encodings = face_recognition.face_encodings(frame, face_locations)
-
-                print(f"👀 Faces detected: {len(face_encodings)}")  
+                x1, y1, x2, y2 = map(int, old_boxes[i])
+                face_region = frame[y1:y2, x1:x2]
+                face_region_rgb = cv2.cvtColor(face_region, cv2.COLOR_BGR2RGB)
+                face_locations = face_recognition.face_locations(face_region_rgb)
+                face_encodings = face_recognition.face_encodings(face_region_rgb, face_locations)
 
                 for face_encoding in face_encodings:
                     matches = face_recognition.compare_faces(known_faces, face_encoding)
                     name = "Unknown"
-
                     if True in matches:
-                        best_match_index = np.argmax(face_recognition.face_distance(known_faces, face_encoding))
+                        best_match_index = np.argmin(face_recognition.face_distance(known_faces, face_encoding))
                         name = known_names[best_match_index]
-                        known_person_detected = True
-                        print(f"✅ Recognized: {name}")  
-
+                        print(f"✅ Recognized: {name}")
                     else:
                         intruder_detected = True
                         print("🚨 Intruder detected !!!!!!")
+                    color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    cv2.putText(frame, name, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-                    # Draw boxes around detected faces
-                    for (top, right, bottom, left) in face_locations:
-                        color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
-                        cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-                        cv2.putText(frame, name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+        # Handle mask detection (single grid logic)
+        mask_status = "No Mask"  # Default to "No Mask" if no strong detection
+        mask_confidence = 0.0
+        mask_box = None
 
-        if not detected_person:
-            print("⚠️ No persons detected by YOLO.")
+        for i, obj in enumerate(new_detected_objects):
+            class_id = int(obj)
+            confidence = float(new_confidences[i])
+            x1, y1, x2, y2 = map(int, new_boxes[i])
+            print(f"New model detected - Class ID: {class_id}, Confidence: {confidence:.2f}, Box: ({x1}, {y1}, {x2}, {y2})")
 
-        # If an intruder is detected, send an MQTT alert
+            # Update mask status based on highest confidence and class
+            if class_id == 1 and confidence > 0.7:  # High confidence "mask"
+                mask_status = "Mask"
+                mask_confidence = confidence
+                mask_box = (x1, y1, x2, y2)
+                break  # Prioritize "mask" if confident
+            elif (class_id == 0 or (class_id == 1 and confidence < 0.7)) and confidence > mask_confidence:
+                mask_status = "No Mask"
+                mask_confidence = confidence
+                mask_box = (x1, y1, x2, y2)
+
+        # Draw only one grid based on the determined status
+        if mask_box:
+            x1, y1, x2, y2 = mask_box
+            if mask_status == "Mask":
+                print(f"✅ {mask_status} detected")
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)  # Blue for mask
+                cv2.putText(frame, f"Mask ({mask_confidence:.2f})", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2)
+            else:
+                print(f"❌ {mask_status} detected")
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)  # Yellow for no mask
+                cv2.putText(frame, f"No Mask ({mask_confidence:.2f})", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+
         if intruder_detected and (time.time() - last_intruder_alert_time) > ALERT_COOLDOWN:
-            intruder_counter += 1  
-            alert_message = {
-                "alert": f"🚨 Intruder {intruder_counter} detected!",
-                "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                "location": "Camera feed",
-                "status": "Unknown person detected",
-                "unique_id": time.time()
-            }
+            intruder_counter += 1
+            alert_message = {"alert": f"🚨 Intruder {intruder_counter} detected!"}
+            client.publish(mqtt_topic_intruder, json.dumps(alert_message))
+            print(f"✅ Sent intruder alert: {alert_message}")
+            last_intruder_alert_time = time.time()
+            send_email_alert()
 
-            result = client.publish(mqtt_topic_intruder, json.dumps(alert_message))
-            if result.rc == 0:
-                print(f"✅ Sent intruder alert: {alert_message}")
-                last_intruder_alert_time = time.time()  
-            else:
-                print(f"❌ Failed to send MQTT alert. Return code: {result.rc}")
-
-        # If a known person is detected, send an MQTT alert
-        if known_person_detected and (time.time() - last_known_person_alert_time) > ALERT_COOLDOWN:
-            known_person_counter += 1
-            known_alert_message = {
-                "alert": f"😊 Known person detected: {name}",
-                "timestamp": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime()),
-                "location": "Camera feed",
-                "status": f"{name} has been recognized",
-                "unique_id": time.time()
-            }
-
-            result = client.publish(mqtt_topic_known_person, json.dumps(known_alert_message))
-            if result.rc == 0:
-                print(f"✅ Sent known person alert: {known_alert_message}")
-                last_known_person_alert_time = time.time()
-            else:
-                print(f"❌ Failed to send MQTT alert. Return code: {result.rc}")
-
-        # Encode frame as JPEG
         _, buffer = cv2.imencode('.jpg', frame)
         frame = buffer.tobytes()
         yield (b'--frame\r\n'
@@ -165,6 +237,14 @@ def generate_frames():
 @app.route('/video_feed')
 def video_feed():
     return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def cleanup():
+    cap.release()
+    client.loop_stop()
+    client.disconnect()
+    print("🧹 Resources cleaned up.")
+
+atexit.register(cleanup)
 
 if __name__ == "__main__":
     print("🚀 Intruder detection system started. Access video feed at: http://<RASPBERRY_PI_IP>:5000/video_feed")
