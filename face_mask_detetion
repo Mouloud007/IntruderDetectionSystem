@@ -44,7 +44,7 @@ import atexit
 app = Flask(__name__)
 
 # MQTT Configuration
-mqtt_broker = "192.168.1.253"  # IP address of the MQTT broker
+mqtt_broker = "192.168.1.000"  # IP address of the MQTT broker
 mqtt_port = 1883  # Port for MQTT communication
 mqtt_topic_intruder = "home/intruder_alert"  # Topic for intruder alerts
 
