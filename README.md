@@ -84,7 +84,7 @@ This script adds new faces to the database. It processes images from a specified
 ### **MQTT Configuration**
 Update the following variables in `face_mask_detetion.py`:
 ```python
-mqtt_broker = "192.168.1.253"  # Replace with your MQTT broker's IP address
+mqtt_broker = "192.168.1.000"  # Replace with your MQTT broker's IP address
 mqtt_port = 1883  # MQTT port
 mqtt_topic_intruder = "home/intruder_alert"  # Topic for intruder alerts
 ```
