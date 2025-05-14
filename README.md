@@ -1,6 +1,6 @@
-# Intruder Detection System
+# Intruder Detection System On A Raspberry PI 5 and Raspberry PI Camera 
 
-This project is a real-time intruder detection system that uses **YOLO object detection**, **face recognition**, and **mask detection** to identify individuals and determine if they are wearing masks. The system sends alerts via **MQTT** and **email notifications** and streams the video feed through a **Flask web server**.
+This project is a real-time intruder detection system that uses **YOLO object detection**, **face recognition**, and **mask detection** to identify individuals and determine if they are wearing masks. The system sends alerts via **MQTT** and **email notifications** and streams the video feed through a **Flask web server**.It is built using Raspberry PI 5 
 
 ---
 
